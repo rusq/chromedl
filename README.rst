@@ -2,6 +2,9 @@
  Chrome File Downloader
 ========================
 
+.. contents::
+   :depth: 2
+
 The sole purpose of this package is to download files from the Internets with
 headless Chrome bypassing the Cloudflare and maybe some other annoying browser
 checks.
