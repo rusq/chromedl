@@ -38,12 +38,10 @@ var UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537
 // afterwards.  Set the timeout on context if required, by default no timeout is
 // set.
 func Get(ctx context.Context, uri string) (io.Reader, error) {
-	opts := [...]func(*chromedp.ExecAllocator){
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Headless,
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserAgent(UserAgent),
-	}
+	)
 
 	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts[:]...)
 	defer cancel()
