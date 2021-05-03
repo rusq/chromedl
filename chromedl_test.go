@@ -3,7 +3,9 @@ package chromedl
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -62,4 +64,21 @@ func serveFile(w http.ResponseWriter, r *http.Request, filename string, data []b
 	w.Header().Set("Content-Control", "private, no-transform, no-store, must-revalidate")
 
 	http.ServeContent(w, r, filename, time.Now(), bytes.NewReader(data))
+}
+
+func ExampleGet() {
+	const rbnzRates = "https://www.rbnz.govt.nz/-/media/ReserveBank/Files/Statistics/tables/b1/hb1-daily.xlsx?revision=5fa61401-a877-4607-b7ae-2e060c09935d"
+	r, err := Get(context.Background(), rbnzRates)
+	if err != nil {
+		log.Fatal(err)
+	}
+	data, err := ioutil.ReadAll(r)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("file size > 0: %v\n", len(data) > 0)
+	fmt.Printf("file signature: %s\n", string(data[0:2]))
+	// Output:
+	// file size > 0: true
+	// file signature: PK
 }
