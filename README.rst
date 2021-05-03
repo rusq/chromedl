@@ -20,6 +20,7 @@ Compatibility
 -------------
 
 Tested with:
+
 * Chrome (stable) v90.0.4430.93.
 * github.com/chromedp/chromedp v0.6.12
 * github.com/chromedp/cdproto v0.0.0-20210323015217-0942afbea50e
