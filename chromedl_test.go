@@ -56,6 +56,52 @@ func TestBrowserDL(t *testing.T) {
 	}
 }
 
+func TestMultiDL(t *testing.T) {
+
+	var iterationC = make(chan int, 1)
+	var format = "test data %d"
+	var filefmt = "test%d.txt"
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		i := <-iterationC
+		file := fmt.Sprintf(filefmt, i)
+		data := fmt.Sprintf(format, i)
+		serveFile(rw, r, file, []byte(data))
+	}))
+	defer srv.Close()
+
+	t.Logf("test server at: %s", srv.URL)
+
+	dlog.SetDebug(true)
+	defer dlog.SetDebug(false)
+	bi, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bi.Stop()
+
+	for i := 0; i < 100; i++ {
+		t.Run(fmt.Sprintf("test %d", i), func(t *testing.T) {
+			val := fmt.Sprintf(format, i)
+			iterationC <- i
+
+			r, err := bi.Get(context.Background(), srv.URL+"/"+fmt.Sprintf(filefmt, i))
+			if err != nil {
+				t.Fatalf("%+v", err)
+			}
+			if r == nil {
+				t.Fatal("reader is nil")
+			}
+			got, err := ioutil.ReadAll(r)
+			if err != nil {
+				t.Fatalf("reader error: %s", err)
+			}
+			if !bytes.Equal(got, []byte(val)) {
+				t.Errorf("data mismatch: got=%q vs want=%q", string(got), val)
+			}
+		})
+	}
+}
+
 func serveFile(w http.ResponseWriter, r *http.Request, filename string, data []byte) {
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename+"")
 	w.Header().Set("Expires", "0")
