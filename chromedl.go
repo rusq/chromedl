@@ -231,17 +231,17 @@ func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	case <-ctx.Done():
 		return nil, errors.WithStack(ctx.Err())
 	case fileGUID := <-bi.guidC:
-		b, err = readFile(bi.tmpdir, fileGUID)
+		b, err = bi.readFile(fileGUID)
 	case reqID := <-bi.requestIDC:
-		b, err = readRequest(ctx, reqID)
+		b, err = bi.readRequest(reqID)
 	}
 	return bytes.NewReader(b), err
 }
 
-func readFile(tmpdir string, name string) ([]byte, error) {
+func (bi *Instance) readFile(name string) ([]byte, error) {
 	// We can predict the exact file location and name here because of how we configured
 	// SetDownloadBehavior and WithDownloadPath
-	downloadPath := filepath.Join(tmpdir, name)
+	downloadPath := filepath.Join(bi.tmpdir, name)
 	b, err := ioutil.ReadFile(downloadPath)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -253,9 +253,9 @@ func readFile(tmpdir string, name string) ([]byte, error) {
 	return b, nil
 }
 
-func readRequest(ctx context.Context, reqID network.RequestID) ([]byte, error) {
+func (bi *Instance) readRequest(reqID network.RequestID) ([]byte, error) {
 	var b []byte
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+	if err := chromedp.Run(bi.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		var err error
 		b, err = network.GetResponseBody(reqID).Do(ctx)
 		return errors.WithStack(err)
