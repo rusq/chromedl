@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/pkg/errors"
 	"github.com/rusq/dlog"
@@ -343,6 +345,21 @@ func TestInstance_waitTransfer(t *testing.T) {
 			false,
 		},
 		{
+			"download cancelled",
+			fields{
+				ctx:    context.Background(),
+				guidC:  make(chan string, 1),
+				tmpdir: testtmp,
+			},
+			args{ctx: context.Background()},
+			func(bi *Instance) error {
+				bi.guidC <- ""
+				return nil
+			},
+			nil,
+			true,
+		},
+		{
 			"cancelled main context",
 			fields{
 				guidC: make(chan string, 1),
@@ -529,4 +546,72 @@ func TestInstance_navigate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestInstance_eventHandler(t *testing.T) {
+	t.Run("download progress event", func(t *testing.T) {
+		bi := &Instance{
+			guidC: make(chan string, 1),
+		}
+		bi.eventHandler(&page.EventDownloadProgress{
+			State: page.DownloadProgressStateCompleted,
+			GUID:  "testGUID",
+		})
+		select {
+		case guid := <-bi.guidC:
+			if !strings.EqualFold(guid, "testGUID") {
+				t.Errorf("wrong value: want=%q, got=%q", "testGUID", guid)
+			}
+		default:
+			t.Error("did not receive anything")
+		}
+	})
+	t.Run("download cancelled event", func(t *testing.T) {
+		bi := &Instance{
+			guidC: make(chan string, 1),
+		}
+		bi.eventHandler(&page.EventDownloadProgress{
+			State: page.DownloadProgressStateCanceled,
+			GUID:  "testGUID",
+		})
+		select {
+		case guid := <-bi.guidC:
+			if guid != "" {
+				t.Errorf("wrong value: want=%q, got=%q", "", guid)
+			}
+		default:
+			t.Error("did not receive anything")
+		}
+	})
+	t.Run("event request will be sent", func(t *testing.T) {
+		bi := &Instance{
+			requestIDC: make(chan network.RequestID, 1),
+			requests:   make(map[network.RequestID]bool),
+		}
+
+		// emulate download start
+		bi.eventHandler(&network.EventRequestWillBeSent{
+			RequestID: "ID",
+			Request:   &network.Request{URL: "http://example"},
+		})
+		if !bi.requests["ID"] {
+			t.Error("request has not been registered")
+		}
+
+		// emulate download complete
+		bi.eventHandler(&network.EventLoadingFinished{RequestID: "ID"})
+		select {
+		case reqID := <-bi.requestIDC:
+			if reqID != "ID" {
+				t.Errorf("request name mismatch: want %q, got %q", "ID", reqID)
+			}
+		default:
+			t.Error("no request ID")
+		}
+
+		// check if request has been removed.
+		if bi.requests["ID"] {
+			t.Error("request has not been removed")
+		}
+	})
 }

@@ -168,8 +168,9 @@ func (bi *Instance) eventHandler(v interface{}) {
 		dlog.Debugf(">>> current download state: %s", ev.State.String())
 		if ev.State == page.DownloadProgressStateCompleted {
 			bi.guidC <- ev.GUID
+		} else if ev.State == page.DownloadProgressStateCanceled {
+			bi.guidC <- ""
 		}
-
 	case *network.EventRequestWillBeSent:
 		dlog.Debugf(">>> EventRequestWillBeSent: %v: %v", ev.RequestID, ev.Request.URL)
 
@@ -186,6 +187,7 @@ func (bi *Instance) eventHandler(v interface{}) {
 			delete(bi.requests, ev.RequestID)
 			bi.mu.Unlock()
 		}
+	// TODO handle nework.EventLoadingFailed
 	default:
 		dlog.Debugf("*** EVENT: %[1]T\n", v)
 	}
@@ -247,6 +249,9 @@ func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	case <-bi.ctx.Done():
 		return nil, errors.WithStack(bi.ctx.Err())
 	case filename := <-bi.guidC:
+		if filename == "" {
+			return nil, errors.New("download was cancelled")
+		}
 		b, err = bi.readFile(filename)
 	case reqID := <-bi.requestIDC:
 		b, err = bi.readRequest(reqID)
