@@ -144,19 +144,25 @@ func (bi *Instance) stopListener() {
 		return
 	}
 	// cancel listener context
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+
 	bi.lnCancel()
 	bi.lnCancel = nil
 }
 
 func (bi *Instance) startListener() {
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+
 	lnctx, cancel := context.WithCancel(bi.ctx)
 	bi.lnCancel = cancel
 
-	chromedp.ListenTarget(lnctx, bi.eventListener)
+	chromedp.ListenTarget(lnctx, bi.eventHandler)
 }
 
-// eventListener returns an Listen
-func (bi *Instance) eventListener(v interface{}) {
+// eventHandler returns an Listen
+func (bi *Instance) eventHandler(v interface{}) {
 	switch ev := v.(type) {
 	case *page.EventDownloadProgress:
 		dlog.Debugf(">>> current download state: %s", ev.State.String())
