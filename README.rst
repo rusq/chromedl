@@ -2,6 +2,11 @@
  Chrome File Downloader
 ========================
 
+.. image:: https://pkg.go.dev/badge/github.com/rusq/chromedl.svg
+   :alt: Go Reference
+   :target: https://pkg.go.dev/github.com/rusq/chromedl 
+
+
 .. contents::
    :depth: 2
 

@@ -28,7 +28,8 @@ import (
 // tempPrefix is the prefix for the temp directory.
 const tempPrefix = "chromedl"
 
-// DefaultUA is the default user agent string that will be used by the browser instance.  Can be changed
+// DefaultUA is the default user agent string that will be used by the browser
+// instance.
 const DefaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36"
 
 // Instance is the browser instance that will be used for downloading files.
@@ -61,7 +62,7 @@ var runner runnerFn = chromedp.Run
 
 type Option func(*config)
 
-// OptUserAgent allows setting the user agent for the browser.
+// OptUserAgent allows setting the user agent for the browser instance.
 func OptUserAgent(ua string) Option {
 	return func(c *config) {
 		if ua == "" {
