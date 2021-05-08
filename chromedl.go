@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/chromedp/cdproto/browser"
 	"github.com/chromedp/cdproto/network"
@@ -26,9 +27,100 @@ import (
 // tempPrefix is the prefix for the temp directory.
 const tempPrefix = "chromedl"
 
-// UserAgent is the user agent string sent to the server.  Can be changed by the
-// caller.
-var UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36"
+// DefaultUA is the default user agent string that will be used by the browser instance.  Can be changed
+const DefaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36"
+
+// Instance is the browser instance that will be used for downloading files.
+type Instance struct {
+	cfg config
+
+	ctx context.Context // context with the browser
+
+	allocCancel   context.CancelFunc // allocator cancel func
+	browserCancel context.CancelFunc // browser cancel func
+	lnCancel      context.CancelFunc // listener cancel func
+
+	guidC      chan string
+	requestIDC chan network.RequestID
+
+	mu       sync.Mutex
+	requests map[network.RequestID]bool
+
+	tmpdir string
+}
+
+type config struct {
+	UserAgent string
+}
+
+type runnerFn = func(ctx context.Context, actions ...chromedp.Action) error
+
+// to be able to mock in tests.
+var runner runnerFn = chromedp.Run
+
+type Option func(*config)
+
+// OptUserAgent allows setting the user agent for the browser.
+func OptUserAgent(ua string) Option {
+	return func(c *config) {
+		if ua == "" {
+			c.UserAgent = DefaultUA
+		}
+		c.UserAgent = ua
+	}
+}
+
+func New(options ...Option) (*Instance, error) {
+
+	cfg := config{
+		UserAgent: DefaultUA,
+	}
+	for _, opt := range options {
+		opt(&cfg)
+	}
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.UserAgent(cfg.UserAgent),
+	)
+
+	allocCtx, aCancel := chromedp.NewExecAllocator(context.Background(), opts[:]...)
+	ctx, cCancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(dlog.Printf), chromedp.WithDebugf(dlog.Debugf))
+
+	tmpdir, err := ioutil.TempDir("", tempPrefix+"*")
+	if err != nil {
+		return nil, err
+	}
+
+	bi := Instance{
+		cfg: cfg,
+
+		ctx:           ctx,
+		allocCancel:   aCancel,
+		browserCancel: cCancel,
+
+		guidC:      make(chan string),
+		requestIDC: make(chan network.RequestID),
+
+		requests: map[network.RequestID]bool{},
+
+		tmpdir: tmpdir,
+	}
+
+	bi.startListener()
+
+	return &bi, nil
+}
+
+func (bi *Instance) Stop() error {
+	bi.stopListener()
+	// close download channels
+	close(bi.guidC)
+	close(bi.requestIDC)
+	bi.browserCancel()
+	bi.allocCancel()
+
+	return os.RemoveAll(bi.tmpdir)
+}
 
 // Get downloads a file from the provided uri using the chromedp capabilities.
 // It will return the reader with the file contents (buffered), and an error if
@@ -36,98 +128,141 @@ var UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537
 // downloaded and read successfully.  It will store the file in the temporary
 // directory once the download is complete, then buffer it and try to cleanup
 // afterwards.  Set the timeout on context if required, by default no timeout is
-// set.
-func Get(ctx context.Context, uri string) (io.Reader, error) {
-
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.UserAgent(UserAgent),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts[:]...)
-	defer cancel()
-
-	// also set up a custom logger
-	ctx, cancel = chromedp.NewContext(allocCtx, chromedp.WithLogf(dlog.Printf), chromedp.WithDebugf(dlog.Debugf))
-	defer cancel()
-
-	// set up channels for different type of download requests.
-	guidC := make(chan string)
-	defer close(guidC)
-	reqIDC := make(chan network.RequestID)
-	defer close(reqIDC)
-
-	var requestId = map[network.RequestID]bool{}
-
-	chromedp.ListenTarget(ctx, func(v interface{}) {
-		switch ev := v.(type) {
-		case *page.EventDownloadProgress:
-			dlog.Debugf(">>> current download state: %s", ev.State.String())
-			if ev.State == page.DownloadProgressStateCompleted {
-				guidC <- ev.GUID
-			}
-		case *network.EventRequestWillBeSent:
-			dlog.Debugf(">>> EventRequestWillBeSent: %v: %v", ev.RequestID, ev.Request.URL)
-			if ev.Request.URL == uri {
-				requestId[ev.RequestID] = true
-			}
-		case *network.EventLoadingFinished:
-			dlog.Debugf(">>> EventLoadingFinished: %v", ev.RequestID)
-			if requestId[ev.RequestID] {
-				reqIDC <- ev.RequestID
-			}
-		default:
-			dlog.Debugf("*** EVENT: %[1]T\n", v)
-		}
-	})
-
-	tmpdir, err := ioutil.TempDir("", tempPrefix+"*")
+// set.  Optionally one can pass the configuration options for the downloader.
+func Get(ctx context.Context, uri string, opts ...Option) (io.Reader, error) {
+	bi, err := New(opts...)
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmpdir)
-	if err := chromedp.Run(ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			scriptID, err := page.AddScriptToEvaluateOnNewDocument(script).Do(ctx)
-			if err != nil {
-				return err
-			}
-			dlog.Debugf("scriptID: %s", scriptID)
-			return nil
-		}),
-		browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).WithDownloadPath(tmpdir),
-		chromedp.Navigate(uri),
-	); err != nil && !strings.Contains(err.Error(), "net::ERR_ABORTED") {
-		// Note: Ignoring the net::ERR_ABORTED page error is essential here since downloads
-		// will cause this error to be emitted, although the download will still succeed.
-		return nil, errors.WithStack(err)
-	}
-
-	return waitComplete(ctx, guidC, reqIDC, tmpdir)
+	defer bi.Stop()
+	return bi.Get(ctx, uri)
 }
 
-// waitComplete waits to receive the completed download from either guid channel
+// stopListener stops the Listener.
+func (bi *Instance) stopListener() {
+	if bi.lnCancel == nil {
+		return
+	}
+	// cancel listener context
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+
+	bi.lnCancel()
+	bi.lnCancel = nil
+}
+
+func (bi *Instance) startListener() {
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+
+	lnctx, cancel := context.WithCancel(bi.ctx)
+	bi.lnCancel = cancel
+
+	chromedp.ListenTarget(lnctx, bi.eventHandler)
+}
+
+// eventHandler returns an Listen
+func (bi *Instance) eventHandler(v interface{}) {
+	switch ev := v.(type) {
+	case *page.EventDownloadProgress:
+		dlog.Debugf(">>> current download state: %s", ev.State.String())
+		if ev.State == page.DownloadProgressStateCompleted {
+			bi.guidC <- ev.GUID
+		} else if ev.State == page.DownloadProgressStateCanceled {
+			bi.guidC <- ""
+		}
+	case *network.EventRequestWillBeSent:
+		dlog.Debugf(">>> EventRequestWillBeSent: %v: %v", ev.RequestID, ev.Request.URL)
+
+		bi.mu.Lock()
+		bi.requests[ev.RequestID] = true
+		bi.mu.Unlock()
+
+	case *network.EventLoadingFinished:
+		dlog.Debugf(">>> EventLoadingFinished: %v", ev.RequestID)
+		if bi.requests[ev.RequestID] {
+			bi.requestIDC <- ev.RequestID
+
+			bi.mu.Lock()
+			delete(bi.requests, ev.RequestID)
+			bi.mu.Unlock()
+		}
+	// TODO handle nework.EventLoadingFailed
+	default:
+		dlog.Debugf("*** EVENT: %[1]T\n", v)
+	}
+}
+
+func (bi *Instance) Get(ctx context.Context, uri string) (io.Reader, error) {
+	if err := bi.navigate(ctx, uri); err != nil {
+		return nil, err
+	}
+	return bi.waitTransfer(ctx)
+}
+
+func (bi *Instance) navigate(ctx context.Context, uri string) error {
+	var errC = make(chan error, 1)
+
+	go func() {
+		errC <- runner(bi.ctx,
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				scriptID, err := page.AddScriptToEvaluateOnNewDocument(script).Do(ctx)
+				if err != nil {
+					return err
+				}
+				dlog.Debugf("scriptID: %s", scriptID)
+				return nil
+			}),
+			browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllowAndName).WithDownloadPath(bi.tmpdir),
+			chromedp.Navigate(uri),
+		)
+	}()
+
+	select {
+	case err := <-errC:
+		if err != nil && !strings.Contains(err.Error(), "net::ERR_ABORTED") {
+			// Note: Ignoring the net::ERR_ABORTED page error is essential here since downloads
+			// will cause this error to be emitted, although the download will still succeed.
+			return errors.WithStack(err)
+		}
+	case <-bi.ctx.Done():
+		return errors.WithStack(bi.ctx.Err())
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	}
+
+	return nil
+}
+
+// waitTransfer waits to receive the completed download from either guid channel
 // or request ID channel.  Then it does what it takes to open the received data,
 // buffer it and return the reader.
-func waitComplete(ctx context.Context, guidC <-chan string, reqIDC <-chan network.RequestID, tmpdir string) (io.Reader, error) {
+func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	// Listening to both available channes to return the download.
-
-	var b []byte
-	var err error
+	var (
+		b   []byte
+		err error
+	)
 	select {
 	case <-ctx.Done():
 		return nil, errors.WithStack(ctx.Err())
-	case fileGUID := <-guidC:
-		b, err = readFile(tmpdir, fileGUID)
-	case reqID := <-reqIDC:
-		b, err = readRequest(ctx, reqID)
+	case <-bi.ctx.Done():
+		return nil, errors.WithStack(bi.ctx.Err())
+	case filename := <-bi.guidC:
+		if filename == "" {
+			return nil, errors.New("download was cancelled")
+		}
+		b, err = bi.readFile(filename)
+	case reqID := <-bi.requestIDC:
+		b, err = bi.readRequest(reqID)
 	}
 	return bytes.NewReader(b), err
 }
 
-func readFile(tmpdir string, name string) ([]byte, error) {
+func (bi *Instance) readFile(name string) ([]byte, error) {
 	// We can predict the exact file location and name here because of how we configured
 	// SetDownloadBehavior and WithDownloadPath
-	downloadPath := filepath.Join(tmpdir, name)
+	downloadPath := filepath.Join(bi.tmpdir, name)
 	b, err := ioutil.ReadFile(downloadPath)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -139,9 +274,9 @@ func readFile(tmpdir string, name string) ([]byte, error) {
 	return b, nil
 }
 
-func readRequest(ctx context.Context, reqID network.RequestID) ([]byte, error) {
+func (bi *Instance) readRequest(reqID network.RequestID) ([]byte, error) {
 	var b []byte
-	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+	if err := runner(bi.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		var err error
 		b, err = network.GetResponseBody(reqID).Do(ctx)
 		return errors.WithStack(err)
