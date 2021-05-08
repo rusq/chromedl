@@ -11,6 +11,7 @@ import (
 	"context"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,20 +148,30 @@ func (bi *Instance) Stop() error {
 	return os.RemoveAll(bi.tmpdir)
 }
 
-// Get downloads a file from the provided uri using the chromedp capabilities.
+// Download downloads a file from the provided uri using the chromedp capabilities.
 // It will return the reader with the file contents (buffered), and an error if
 // any.  If the error is present, reader may not be nil if the file was
 // downloaded and read successfully.  It will store the file in the temporary
 // directory once the download is complete, then buffer it and try to cleanup
 // afterwards.  Set the timeout on context if required, by default no timeout is
 // set.  Optionally one can pass the configuration options for the downloader.
-func Get(ctx context.Context, uri string, opts ...Option) (io.Reader, error) {
+func Download(ctx context.Context, uri string, opts ...Option) (io.Reader, error) {
 	bi, err := New(opts...)
 	if err != nil {
 		return nil, err
 	}
 	defer bi.Stop()
-	return bi.Get(ctx, uri)
+	return bi.Download(ctx, uri)
+}
+
+// Get is drop-in replacement for http.Get.
+func Get(url string) (*http.Response, error) {
+	bi, err := New()
+	if err != nil {
+		return nil, err
+	}
+	defer bi.Stop()
+	return bi.Get(url)
 }
 
 // stopListener stops the Listener.
@@ -218,12 +229,41 @@ func (bi *Instance) eventHandler(v interface{}) {
 	}
 }
 
-// Get gets the file.
-func (bi *Instance) Get(ctx context.Context, uri string) (io.Reader, error) {
+// Download downloads the file returning the reader with contents.
+func (bi *Instance) Download(ctx context.Context, uri string) (io.Reader, error) {
+	return bi.download(ctx, uri)
+}
+func (bi *Instance) download(ctx context.Context, uri string) (*bytes.Buffer, error) {
 	if err := bi.navigate(ctx, uri); err != nil {
 		return nil, err
 	}
 	return bi.waitTransfer(ctx)
+}
+
+// Get partly emulates http.Get to some extent and is meant to be drop-in
+// replacement for http.Get in the callers code.
+func (bi *Instance) Get(url string) (*http.Response, error) {
+	return bi.get(context.Background(), url)
+}
+func (bi *Instance) get(ctx context.Context, url string) (*http.Response, error) {
+	buf, err := bi.download(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := http.Response{
+		Status:        http.StatusText(http.StatusOK),
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.0",
+		ProtoMajor:    1,
+		ProtoMinor:    0,
+		Body:          io.NopCloser(buf),
+		ContentLength: int64(buf.Len()),
+		Close:         true,
+		Uncompressed:  true,
+		Request:       req,
+	}
+	return &resp, nil
 }
 
 func (bi *Instance) navigate(ctx context.Context, uri string) error {
@@ -262,8 +302,8 @@ func (bi *Instance) navigate(ctx context.Context, uri string) error {
 
 // waitTransfer waits to receive the completed download from either guid channel
 // or request ID channel.  Then it does what it takes to open the received data,
-// buffer it and return the reader.
-func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
+// and returns the bytes.Buffer with data.
+func (bi *Instance) waitTransfer(ctx context.Context) (*bytes.Buffer, error) {
 	// Listening to both available channes to return the download.
 	var (
 		b   []byte
@@ -282,7 +322,8 @@ func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	case reqID := <-bi.requestIDC:
 		b, err = bi.readRequest(reqID)
 	}
-	return bytes.NewReader(b), err
+
+	return bytes.NewBuffer(b), err
 }
 
 func (bi *Instance) readFile(name string) ([]byte, error) {

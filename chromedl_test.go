@@ -33,7 +33,7 @@ func fakeRunnerWithErr(err error) runnerFn {
 	}
 }
 
-func TestBrowserDL(t *testing.T) {
+func TestDownload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		serveFile(rw, r, "test.txt", []byte("test data"))
 	}))
@@ -50,7 +50,7 @@ func TestBrowserDL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := Get(context.Background(), tt.uri)
+			r, err := Download(context.Background(), tt.uri)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Get() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -97,7 +97,7 @@ func TestMultiDL(t *testing.T) {
 			val := fmt.Sprintf(format, i)
 			iterationC <- i
 
-			r, err := bi.Get(context.Background(), srv.URL+"/"+fmt.Sprintf(filefmt, i))
+			r, err := bi.Download(context.Background(), srv.URL+"/"+fmt.Sprintf(filefmt, i))
 			if err != nil {
 				t.Fatalf("%+v", err)
 			}
@@ -125,9 +125,9 @@ func serveFile(w http.ResponseWriter, r *http.Request, filename string, data []b
 	http.ServeContent(w, r, filename, time.Now(), bytes.NewReader(data))
 }
 
-func ExampleGet() {
+func ExampleDownload() {
 	const rbnzRates = "https://www.rbnz.govt.nz/-/media/ReserveBank/Files/Statistics/tables/b1/hb1-daily.xlsx?revision=5fa61401-a877-4607-b7ae-2e060c09935d"
-	r, err := Get(context.Background(), rbnzRates)
+	r, err := Download(context.Background(), rbnzRates)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -185,15 +185,15 @@ func TestInstance_readRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			bi := &Instance{
-				cfg:           tt.fields.cfg,
-				ctx:           tt.fields.ctx,
-				allocCancel:   tt.fields.allocCancel,
-				browserCancel: tt.fields.browserCancel,
-				lnCancel:      tt.fields.lnCancel,
-				guidC:         tt.fields.guidC,
-				requestIDC:    tt.fields.requestIDC,
-				requests:      tt.fields.requests,
-				tmpdir:        tt.fields.tmpdir,
+				cfg:        tt.fields.cfg,
+				ctx:        tt.fields.ctx,
+				allocFn:    tt.fields.allocCancel,
+				browserFn:  tt.fields.browserCancel,
+				lnCancel:   tt.fields.lnCancel,
+				guidC:      tt.fields.guidC,
+				requestIDC: tt.fields.requestIDC,
+				requests:   tt.fields.requests,
+				tmpdir:     tt.fields.tmpdir,
 			}
 			oldRunner := runner
 			defer func() {
@@ -212,6 +212,7 @@ func TestInstance_readRequest(t *testing.T) {
 	}
 }
 
+// genFile generates a temporary file in directory dir with contents.
 func genFile(t *testing.T, dir string, contents string) string {
 	f, err := ioutil.TempFile(dir, "tmp*")
 	if err != nil {
@@ -270,15 +271,15 @@ func TestInstance_readFile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			defer os.Remove(tt.args.name)
 			bi := &Instance{
-				cfg:           tt.fields.cfg,
-				ctx:           tt.fields.ctx,
-				allocCancel:   tt.fields.allocCancel,
-				browserCancel: tt.fields.browserCancel,
-				lnCancel:      tt.fields.lnCancel,
-				guidC:         tt.fields.guidC,
-				requestIDC:    tt.fields.requestIDC,
-				requests:      tt.fields.requests,
-				tmpdir:        tt.fields.tmpdir,
+				cfg:        tt.fields.cfg,
+				ctx:        tt.fields.ctx,
+				allocFn:    tt.fields.allocCancel,
+				browserFn:  tt.fields.browserCancel,
+				lnCancel:   tt.fields.lnCancel,
+				guidC:      tt.fields.guidC,
+				requestIDC: tt.fields.requestIDC,
+				requests:   tt.fields.requests,
+				tmpdir:     tt.fields.tmpdir,
 			}
 			got, err := bi.readFile(tt.args.name)
 			if (err != nil) != tt.wantErr {
@@ -428,15 +429,15 @@ func TestInstance_waitTransfer(t *testing.T) {
 			}()
 			runner = fakeRunnerWithErr(nil)
 			bi := &Instance{
-				cfg:           tt.fields.cfg,
-				ctx:           tt.fields.ctx,
-				allocCancel:   tt.fields.allocCancel,
-				browserCancel: tt.fields.browserCancel,
-				lnCancel:      tt.fields.lnCancel,
-				guidC:         tt.fields.guidC,
-				requestIDC:    tt.fields.requestIDC,
-				requests:      tt.fields.requests,
-				tmpdir:        tt.fields.tmpdir,
+				cfg:        tt.fields.cfg,
+				ctx:        tt.fields.ctx,
+				allocFn:    tt.fields.allocCancel,
+				browserFn:  tt.fields.browserCancel,
+				lnCancel:   tt.fields.lnCancel,
+				guidC:      tt.fields.guidC,
+				requestIDC: tt.fields.requestIDC,
+				requests:   tt.fields.requests,
+				tmpdir:     tt.fields.tmpdir,
 			}
 			if err := tt.init(bi); err != nil {
 				t.Fatalf("init failed: %s", err)
@@ -531,15 +532,15 @@ func TestInstance_navigate(t *testing.T) {
 			}()
 			runner = tt.runnerFn
 			bi := &Instance{
-				cfg:           tt.fields.cfg,
-				ctx:           tt.fields.ctx,
-				allocCancel:   tt.fields.allocCancel,
-				browserCancel: tt.fields.browserCancel,
-				lnCancel:      tt.fields.lnCancel,
-				guidC:         tt.fields.guidC,
-				requestIDC:    tt.fields.requestIDC,
-				requests:      tt.fields.requests,
-				tmpdir:        tt.fields.tmpdir,
+				cfg:        tt.fields.cfg,
+				ctx:        tt.fields.ctx,
+				allocFn:    tt.fields.allocCancel,
+				browserFn:  tt.fields.browserCancel,
+				lnCancel:   tt.fields.lnCancel,
+				guidC:      tt.fields.guidC,
+				requestIDC: tt.fields.requestIDC,
+				requests:   tt.fields.requests,
+				tmpdir:     tt.fields.tmpdir,
 			}
 			if err := bi.navigate(tt.args.ctx, tt.args.uri); (err != nil) != tt.wantErr {
 				t.Errorf("Instance.navigate() error = %v, wantErr %v", err, tt.wantErr)
