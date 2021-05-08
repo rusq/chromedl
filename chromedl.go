@@ -152,36 +152,37 @@ func (bi *Instance) startListener() {
 	lnctx, cancel := context.WithCancel(bi.ctx)
 	bi.lnCancel = cancel
 
-	var requestId = map[network.RequestID]bool{}
+	chromedp.ListenTarget(lnctx, bi.eventListener)
+}
 
-	chromedp.ListenTarget(lnctx, func(v interface{}) {
-		switch ev := v.(type) {
-		case *page.EventDownloadProgress:
-			dlog.Debugf(">>> current download state: %s", ev.State.String())
-			if ev.State == page.DownloadProgressStateCompleted {
-				bi.guidC <- ev.GUID
-			}
+// eventListener returns an Listen
+func (bi *Instance) eventListener(v interface{}) {
+	switch ev := v.(type) {
+	case *page.EventDownloadProgress:
+		dlog.Debugf(">>> current download state: %s", ev.State.String())
+		if ev.State == page.DownloadProgressStateCompleted {
+			bi.guidC <- ev.GUID
+		}
 
-		case *network.EventRequestWillBeSent:
-			dlog.Debugf(">>> EventRequestWillBeSent: %v: %v", ev.RequestID, ev.Request.URL)
+	case *network.EventRequestWillBeSent:
+		dlog.Debugf(">>> EventRequestWillBeSent: %v: %v", ev.RequestID, ev.Request.URL)
+
+		bi.mu.Lock()
+		bi.requests[ev.RequestID] = true
+		bi.mu.Unlock()
+
+	case *network.EventLoadingFinished:
+		dlog.Debugf(">>> EventLoadingFinished: %v", ev.RequestID)
+		if bi.requests[ev.RequestID] {
+			bi.requestIDC <- ev.RequestID
 
 			bi.mu.Lock()
-			bi.requests[ev.RequestID] = true
+			delete(bi.requests, ev.RequestID)
 			bi.mu.Unlock()
-
-		case *network.EventLoadingFinished:
-			dlog.Debugf(">>> EventLoadingFinished: %v", ev.RequestID)
-			if requestId[ev.RequestID] {
-				bi.requestIDC <- ev.RequestID
-
-				bi.mu.Lock()
-				delete(requestId, ev.RequestID)
-				bi.mu.Unlock()
-			}
-		default:
-			dlog.Debugf("*** EVENT: %[1]T\n", v)
 		}
-	})
+	default:
+		dlog.Debugf("*** EVENT: %[1]T\n", v)
+	}
 }
 
 func (bi *Instance) Get(ctx context.Context, uri string) (io.Reader, error) {
