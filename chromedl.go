@@ -53,6 +53,11 @@ type config struct {
 	UserAgent string
 }
 
+type runnerFn = func(ctx context.Context, actions ...chromedp.Action) error
+
+// to be able to mock in tests.
+var runner runnerFn = chromedp.Run
+
 type Option func(*config)
 
 // OptUserAgent allows setting the user agent for the browser.
@@ -190,7 +195,7 @@ func (bi *Instance) navigate(ctx context.Context, uri string) error {
 	var errC = make(chan error, 1)
 
 	go func() {
-		errC <- chromedp.Run(bi.ctx,
+		errC <- runner(bi.ctx,
 			chromedp.ActionFunc(func(ctx context.Context) error {
 				scriptID, err := page.AddScriptToEvaluateOnNewDocument(script).Do(ctx)
 				if err != nil {
@@ -211,6 +216,8 @@ func (bi *Instance) navigate(ctx context.Context, uri string) error {
 			// will cause this error to be emitted, although the download will still succeed.
 			return errors.WithStack(err)
 		}
+	case <-bi.ctx.Done():
+		return errors.WithStack(bi.ctx.Err())
 	case <-ctx.Done():
 		return errors.WithStack(ctx.Err())
 	}
@@ -230,8 +237,10 @@ func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	select {
 	case <-ctx.Done():
 		return nil, errors.WithStack(ctx.Err())
-	case fileGUID := <-bi.guidC:
-		b, err = bi.readFile(fileGUID)
+	case <-bi.ctx.Done():
+		return nil, errors.WithStack(bi.ctx.Err())
+	case filename := <-bi.guidC:
+		b, err = bi.readFile(filename)
 	case reqID := <-bi.requestIDC:
 		b, err = bi.readRequest(reqID)
 	}
@@ -255,7 +264,7 @@ func (bi *Instance) readFile(name string) ([]byte, error) {
 
 func (bi *Instance) readRequest(reqID network.RequestID) ([]byte, error) {
 	var b []byte
-	if err := chromedp.Run(bi.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+	if err := runner(bi.ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		var err error
 		b, err = network.GetResponseBody(reqID).Do(ctx)
 		return errors.WithStack(err)

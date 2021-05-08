@@ -8,16 +8,27 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
+	"github.com/pkg/errors"
 	"github.com/rusq/dlog"
 )
 
 func init() {
 	dlog.SetDebug(true)
+}
+
+func fakeRunnerWithErr(err error) runnerFn {
+	return func(ctx context.Context, actions ...chromedp.Action) error {
+		return err
+	}
 }
 
 func TestBrowserDL(t *testing.T) {
@@ -127,4 +138,395 @@ func ExampleGet() {
 	// Output:
 	// file size > 0: true
 	// file signature: PK
+}
+
+func TestInstance_readRequest(t *testing.T) {
+	type fields struct {
+		cfg           config
+		ctx           context.Context
+		allocCancel   context.CancelFunc
+		browserCancel context.CancelFunc
+		lnCancel      context.CancelFunc
+		guidC         chan string
+		requestIDC    chan network.RequestID
+		requests      map[network.RequestID]bool
+		tmpdir        string
+	}
+	type args struct {
+		reqID network.RequestID
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		runner  runnerFn
+		want    []byte
+		wantErr bool
+	}{
+		{
+			"no error",
+			fields{},
+			args{reqID: network.RequestID("123")},
+			fakeRunnerWithErr(nil),
+			nil,
+			false,
+		},
+		{
+			"error",
+			fields{},
+			args{reqID: network.RequestID("123")},
+			fakeRunnerWithErr(errors.New("failed")),
+			nil,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bi := &Instance{
+				cfg:           tt.fields.cfg,
+				ctx:           tt.fields.ctx,
+				allocCancel:   tt.fields.allocCancel,
+				browserCancel: tt.fields.browserCancel,
+				lnCancel:      tt.fields.lnCancel,
+				guidC:         tt.fields.guidC,
+				requestIDC:    tt.fields.requestIDC,
+				requests:      tt.fields.requests,
+				tmpdir:        tt.fields.tmpdir,
+			}
+			oldRunner := runner
+			defer func() {
+				runner = oldRunner
+			}()
+			runner = tt.runner
+			got, err := bi.readRequest(tt.args.reqID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Instance.readRequest() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Instance.readRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func genFile(t *testing.T, dir string, contents string) string {
+	f, err := ioutil.TempFile(dir, "tmp*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	f.Write([]byte(contents))
+	return filepath.Base(f.Name())
+}
+
+func TestInstance_readFile(t *testing.T) {
+	const contents = "test contents"
+	testtmp, err := ioutil.TempDir("", "chromedl_test*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testtmp)
+
+	type fields struct {
+		cfg           config
+		ctx           context.Context
+		allocCancel   context.CancelFunc
+		browserCancel context.CancelFunc
+		lnCancel      context.CancelFunc
+		guidC         chan string
+		requestIDC    chan network.RequestID
+		requests      map[network.RequestID]bool
+		tmpdir        string
+	}
+	type args struct {
+		name string
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		want    []byte
+		wantErr bool
+	}{
+		{
+			"no error",
+			fields{tmpdir: testtmp},
+			args{name: genFile(t, testtmp, contents)},
+			[]byte(contents),
+			false,
+		},
+		{
+			"non-existing",
+			fields{tmpdir: testtmp},
+			args{name: "$not here$"},
+			nil,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defer os.Remove(tt.args.name)
+			bi := &Instance{
+				cfg:           tt.fields.cfg,
+				ctx:           tt.fields.ctx,
+				allocCancel:   tt.fields.allocCancel,
+				browserCancel: tt.fields.browserCancel,
+				lnCancel:      tt.fields.lnCancel,
+				guidC:         tt.fields.guidC,
+				requestIDC:    tt.fields.requestIDC,
+				requests:      tt.fields.requests,
+				tmpdir:        tt.fields.tmpdir,
+			}
+			got, err := bi.readFile(tt.args.name)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Instance.readFile() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Instance.readFile() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstance_waitTransfer(t *testing.T) {
+	const contents = "test contents"
+	testtmp, err := ioutil.TempDir("", "chromedl_test*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testtmp)
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type fields struct {
+		cfg           config
+		ctx           context.Context
+		allocCancel   context.CancelFunc
+		browserCancel context.CancelFunc
+		lnCancel      context.CancelFunc
+		guidC         chan string
+		requestIDC    chan network.RequestID
+		requests      map[network.RequestID]bool
+		tmpdir        string
+	}
+	type args struct {
+		ctx context.Context
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		init    func(bi *Instance) error
+		want    []byte
+		wantErr bool
+	}{
+		{
+			"file guid",
+			fields{
+				ctx:    context.Background(),
+				guidC:  make(chan string, 1),
+				tmpdir: testtmp,
+			},
+			args{ctx: context.Background()},
+			func(bi *Instance) error {
+				const filename = "test_data.txt"
+				if err := ioutil.WriteFile(filepath.Join(bi.tmpdir, filename), []byte(contents), 0644); err != nil {
+					return errors.WithStack(err)
+				}
+				bi.guidC <- filename
+				return nil
+			},
+			[]byte(contents),
+			false,
+		},
+		{
+			"cancelled main context",
+			fields{
+				guidC: make(chan string, 1),
+			},
+			args{ctx: context.Background()},
+			func(bi *Instance) error {
+				ctx, cancel := context.WithCancel(context.Background())
+				bi.ctx = ctx
+				cancel()
+
+				// to ensure - sending the file on the guidC after some time.
+				go time.AfterFunc(1*time.Second, func() {
+					const filename = "test_data.txt"
+					if err := ioutil.WriteFile(filepath.Join(bi.tmpdir, filename), []byte(contents), 0644); err != nil {
+						t.Log(err)
+					}
+					bi.guidC <- filename
+				})
+				return nil
+			},
+			nil,
+			true,
+		},
+		{
+			"cancelled function context",
+			fields{
+				ctx:   context.Background(),
+				guidC: make(chan string, 1),
+			},
+			args{ctx: cancelledCtx},
+			func(bi *Instance) error {
+				// to ensure - sending the file on the guidC after some time.
+				go time.AfterFunc(1*time.Second, func() {
+					const filename = "test_data.txt"
+					if err := ioutil.WriteFile(filepath.Join(bi.tmpdir, filename), []byte(contents), 0644); err != nil {
+						t.Log(err)
+					}
+					bi.guidC <- filename
+				})
+				return nil
+			},
+			nil,
+			true,
+		},
+		{
+			"request",
+			fields{
+				ctx:        context.Background(),
+				requestIDC: make(chan network.RequestID, 1),
+				tmpdir:     testtmp,
+			},
+			args{ctx: context.Background()},
+			func(bi *Instance) error {
+				bi.requestIDC <- network.RequestID("test")
+				return nil
+			},
+			[]byte{},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldRunner := runner
+			defer func() {
+				runner = oldRunner
+			}()
+			runner = fakeRunnerWithErr(nil)
+			bi := &Instance{
+				cfg:           tt.fields.cfg,
+				ctx:           tt.fields.ctx,
+				allocCancel:   tt.fields.allocCancel,
+				browserCancel: tt.fields.browserCancel,
+				lnCancel:      tt.fields.lnCancel,
+				guidC:         tt.fields.guidC,
+				requestIDC:    tt.fields.requestIDC,
+				requests:      tt.fields.requests,
+				tmpdir:        tt.fields.tmpdir,
+			}
+			if err := tt.init(bi); err != nil {
+				t.Fatalf("init failed: %s", err)
+			}
+			r, err := bi.waitTransfer(tt.args.ctx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Instance.waitTransfer() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if r == nil {
+				return
+			}
+			got, err := ioutil.ReadAll(r)
+			if err != nil {
+				t.Fatalf("failed to read: %s", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Instance.waitTransfer() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstance_navigate(t *testing.T) {
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	type fields struct {
+		cfg           config
+		ctx           context.Context
+		allocCancel   context.CancelFunc
+		browserCancel context.CancelFunc
+		lnCancel      context.CancelFunc
+		guidC         chan string
+		requestIDC    chan network.RequestID
+		requests      map[network.RequestID]bool
+		tmpdir        string
+	}
+	type args struct {
+		ctx context.Context
+		uri string
+	}
+	tests := []struct {
+		name     string
+		fields   fields
+		runnerFn runnerFn
+		args     args
+		wantErr  bool
+	}{
+		{
+			"no error",
+			fields{
+				ctx: context.Background(),
+			},
+			fakeRunnerWithErr(nil),
+			args{ctx: context.Background(), uri: "test"},
+			false,
+		},
+		{
+			"error",
+			fields{
+				ctx: context.Background(),
+			},
+			fakeRunnerWithErr(errors.New("test error")),
+			args{ctx: context.Background(), uri: "test"},
+			true,
+		},
+		{
+			"main context cancelled",
+			fields{
+				ctx: cancelledCtx,
+			},
+			fakeRunnerWithErr(nil),
+			args{ctx: context.Background(), uri: "test"},
+			true,
+		},
+		{
+			"arg context cancelled",
+			fields{
+				ctx: context.Background(),
+			},
+			fakeRunnerWithErr(nil),
+			args{ctx: cancelledCtx, uri: "test"},
+			true,
+		},
+	}
+	for _, tt := range tests {
+
+		t.Run(tt.name, func(t *testing.T) {
+			oldRunner := runner
+			defer func() {
+				runner = oldRunner
+			}()
+			runner = tt.runnerFn
+			bi := &Instance{
+				cfg:           tt.fields.cfg,
+				ctx:           tt.fields.ctx,
+				allocCancel:   tt.fields.allocCancel,
+				browserCancel: tt.fields.browserCancel,
+				lnCancel:      tt.fields.lnCancel,
+				guidC:         tt.fields.guidC,
+				requestIDC:    tt.fields.requestIDC,
+				requests:      tt.fields.requests,
+				tmpdir:        tt.fields.tmpdir,
+			}
+			if err := bi.navigate(tt.args.ctx, tt.args.uri); (err != nil) != tt.wantErr {
+				t.Errorf("Instance.navigate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
 }
