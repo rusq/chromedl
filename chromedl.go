@@ -11,6 +11,7 @@ import (
 	"context"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,9 +37,9 @@ type Instance struct {
 
 	ctx context.Context // context with the browser
 
-	allocCancel   context.CancelFunc // allocator cancel func
-	browserCancel context.CancelFunc // browser cancel func
-	lnCancel      context.CancelFunc // listener cancel func
+	allocFn   context.CancelFunc // allocator cancel func
+	browserFn context.CancelFunc // browser cancel func
+	lnCancel  context.CancelFunc // listener cancel func
 
 	guidC      chan string
 	requestIDC chan network.RequestID
@@ -70,6 +71,8 @@ func OptUserAgent(ua string) Option {
 	}
 }
 
+// New creates a new Instance, starting up the headless chrome to do the download.
+// Once finished, call Stop to terminate the browser.
 func New(options ...Option) (*Instance, error) {
 
 	cfg := config{
@@ -86,6 +89,10 @@ func New(options ...Option) (*Instance, error) {
 	allocCtx, aCancel := chromedp.NewExecAllocator(context.Background(), opts[:]...)
 	ctx, cCancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(dlog.Printf), chromedp.WithDebugf(dlog.Debugf))
 
+	return newInstance(ctx, cfg, aCancel, cCancel)
+}
+
+func newInstance(ctx context.Context, cfg config, allocCFn, ctxCFn context.CancelFunc) (*Instance, error) {
 	tmpdir, err := ioutil.TempDir("", tempPrefix+"*")
 	if err != nil {
 		return nil, err
@@ -94,9 +101,9 @@ func New(options ...Option) (*Instance, error) {
 	bi := Instance{
 		cfg: cfg,
 
-		ctx:           ctx,
-		allocCancel:   aCancel,
-		browserCancel: cCancel,
+		ctx:       ctx,
+		allocFn:   allocCFn,
+		browserFn: ctxCFn,
 
 		guidC:      make(chan string),
 		requestIDC: make(chan network.RequestID),
@@ -111,31 +118,60 @@ func New(options ...Option) (*Instance, error) {
 	return &bi, nil
 }
 
+// ErrNoChrome indicates that there's no chrome instance in the context.
+var ErrNoChrome = errors.New("no chrome instance in the context")
+
+// NewWithChromeCtx creates new Instance for existing browser instance.  Stop will not terminate
+// the browser, but will cancel the event listener.
+func NewWithChromeCtx(taskCtx context.Context, options ...Option) (*Instance, error) {
+	if chrome := chromedp.FromContext(taskCtx); chrome == nil {
+		return nil, ErrNoChrome
+	}
+	return newInstance(taskCtx, config{}, nil, nil)
+}
+
 func (bi *Instance) Stop() error {
 	bi.stopListener()
 	// close download channels
 	close(bi.guidC)
 	close(bi.requestIDC)
-	bi.browserCancel()
-	bi.allocCancel()
 
+	// cancel contexts if cancel functions are set
+	if bi.allocFn != nil {
+		bi.browserFn()
+	}
+	if bi.allocFn != nil {
+		bi.allocFn()
+	}
+
+	// remove temporary dir with any residual files
 	return os.RemoveAll(bi.tmpdir)
 }
 
-// Get downloads a file from the provided uri using the chromedp capabilities.
+// Download downloads a file from the provided uri using the chromedp capabilities.
 // It will return the reader with the file contents (buffered), and an error if
 // any.  If the error is present, reader may not be nil if the file was
 // downloaded and read successfully.  It will store the file in the temporary
 // directory once the download is complete, then buffer it and try to cleanup
 // afterwards.  Set the timeout on context if required, by default no timeout is
 // set.  Optionally one can pass the configuration options for the downloader.
-func Get(ctx context.Context, uri string, opts ...Option) (io.Reader, error) {
+func Download(ctx context.Context, uri string, opts ...Option) (io.Reader, error) {
 	bi, err := New(opts...)
 	if err != nil {
 		return nil, err
 	}
 	defer bi.Stop()
-	return bi.Get(ctx, uri)
+	return bi.Download(ctx, uri)
+}
+
+// Get is drop-in replacement for http.Get.
+func Get(url string) (*http.Response, error) {
+	bi, err := New()
+	if err != nil {
+		return nil, err
+	}
+	defer bi.Stop()
+	return bi.Get(url)
 }
 
 // stopListener stops the Listener.
@@ -161,7 +197,7 @@ func (bi *Instance) startListener() {
 	chromedp.ListenTarget(lnctx, bi.eventHandler)
 }
 
-// eventHandler returns an Listen
+// eventHandler handles the download event.
 func (bi *Instance) eventHandler(v interface{}) {
 	switch ev := v.(type) {
 	case *page.EventDownloadProgress:
@@ -193,11 +229,41 @@ func (bi *Instance) eventHandler(v interface{}) {
 	}
 }
 
-func (bi *Instance) Get(ctx context.Context, uri string) (io.Reader, error) {
+// Download downloads the file returning the reader with contents.
+func (bi *Instance) Download(ctx context.Context, uri string) (io.Reader, error) {
+	return bi.download(ctx, uri)
+}
+func (bi *Instance) download(ctx context.Context, uri string) (*bytes.Buffer, error) {
 	if err := bi.navigate(ctx, uri); err != nil {
 		return nil, err
 	}
 	return bi.waitTransfer(ctx)
+}
+
+// Get partly emulates http.Get to some extent and is meant to be drop-in
+// replacement for http.Get in the callers code.
+func (bi *Instance) Get(url string) (*http.Response, error) {
+	return bi.get(context.Background(), url)
+}
+func (bi *Instance) get(ctx context.Context, url string) (*http.Response, error) {
+	buf, err := bi.download(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	req, _ := http.NewRequest("GET", url, nil)
+	resp := http.Response{
+		Status:        http.StatusText(http.StatusOK),
+		StatusCode:    http.StatusOK,
+		Proto:         "HTTP/1.0",
+		ProtoMajor:    1,
+		ProtoMinor:    0,
+		Body:          io.NopCloser(buf),
+		ContentLength: int64(buf.Len()),
+		Close:         true,
+		Uncompressed:  true,
+		Request:       req,
+	}
+	return &resp, nil
 }
 
 func (bi *Instance) navigate(ctx context.Context, uri string) error {
@@ -236,8 +302,8 @@ func (bi *Instance) navigate(ctx context.Context, uri string) error {
 
 // waitTransfer waits to receive the completed download from either guid channel
 // or request ID channel.  Then it does what it takes to open the received data,
-// buffer it and return the reader.
-func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
+// and returns the bytes.Buffer with data.
+func (bi *Instance) waitTransfer(ctx context.Context) (*bytes.Buffer, error) {
 	// Listening to both available channes to return the download.
 	var (
 		b   []byte
@@ -256,7 +322,8 @@ func (bi *Instance) waitTransfer(ctx context.Context) (io.Reader, error) {
 	case reqID := <-bi.requestIDC:
 		b, err = bi.readRequest(reqID)
 	}
-	return bytes.NewReader(b), err
+
+	return bytes.NewBuffer(b), err
 }
 
 func (bi *Instance) readFile(name string) ([]byte, error) {
