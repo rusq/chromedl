@@ -36,9 +36,9 @@ type Instance struct {
 
 	ctx context.Context // context with the browser
 
-	allocCancel   context.CancelFunc // allocator cancel func
-	browserCancel context.CancelFunc // browser cancel func
-	lnCancel      context.CancelFunc // listener cancel func
+	allocFn   context.CancelFunc // allocator cancel func
+	browserFn context.CancelFunc // browser cancel func
+	lnCancel  context.CancelFunc // listener cancel func
 
 	guidC      chan string
 	requestIDC chan network.RequestID
@@ -70,6 +70,8 @@ func OptUserAgent(ua string) Option {
 	}
 }
 
+// New creates a new Instance, starting up the headless chrome to do the download.
+// Once finished, call Stop to terminate the browser.
 func New(options ...Option) (*Instance, error) {
 
 	cfg := config{
@@ -86,6 +88,10 @@ func New(options ...Option) (*Instance, error) {
 	allocCtx, aCancel := chromedp.NewExecAllocator(context.Background(), opts[:]...)
 	ctx, cCancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(dlog.Printf), chromedp.WithDebugf(dlog.Debugf))
 
+	return newInstance(ctx, cfg, aCancel, cCancel)
+}
+
+func newInstance(ctx context.Context, cfg config, allocCFn, ctxCFn context.CancelFunc) (*Instance, error) {
 	tmpdir, err := ioutil.TempDir("", tempPrefix+"*")
 	if err != nil {
 		return nil, err
@@ -94,9 +100,9 @@ func New(options ...Option) (*Instance, error) {
 	bi := Instance{
 		cfg: cfg,
 
-		ctx:           ctx,
-		allocCancel:   aCancel,
-		browserCancel: cCancel,
+		ctx:       ctx,
+		allocFn:   allocCFn,
+		browserFn: ctxCFn,
 
 		guidC:      make(chan string),
 		requestIDC: make(chan network.RequestID),
@@ -111,14 +117,33 @@ func New(options ...Option) (*Instance, error) {
 	return &bi, nil
 }
 
+// ErrNoChrome indicates that there's no chrome instance in the context.
+var ErrNoChrome = errors.New("no chrome instance in the context")
+
+// NewWithChromeCtx creates new Instance for existing browser instance.  Stop will not terminate
+// the browser, but will cancel the event listener.
+func NewWithChromeCtx(taskCtx context.Context, options ...Option) (*Instance, error) {
+	if chrome := chromedp.FromContext(taskCtx); chrome == nil {
+		return nil, ErrNoChrome
+	}
+	return newInstance(taskCtx, config{}, nil, nil)
+}
+
 func (bi *Instance) Stop() error {
 	bi.stopListener()
 	// close download channels
 	close(bi.guidC)
 	close(bi.requestIDC)
-	bi.browserCancel()
-	bi.allocCancel()
 
+	// cancel contexts if cancel functions are set
+	if bi.allocFn != nil {
+		bi.browserFn()
+	}
+	if bi.allocFn != nil {
+		bi.allocFn()
+	}
+
+	// remove temporary dir with any residual files
 	return os.RemoveAll(bi.tmpdir)
 }
 
@@ -161,7 +186,7 @@ func (bi *Instance) startListener() {
 	chromedp.ListenTarget(lnctx, bi.eventHandler)
 }
 
-// eventHandler returns an Listen
+// eventHandler handles the download event.
 func (bi *Instance) eventHandler(v interface{}) {
 	switch ev := v.(type) {
 	case *page.EventDownloadProgress:
@@ -193,6 +218,7 @@ func (bi *Instance) eventHandler(v interface{}) {
 	}
 }
 
+// Get gets the file.
 func (bi *Instance) Get(ctx context.Context, uri string) (io.Reader, error) {
 	if err := bi.navigate(ctx, uri); err != nil {
 		return nil, err
